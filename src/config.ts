@@ -10,6 +10,36 @@ import { CLAUDE_CODE_VERSION } from './constants.ts'
  */
 export const ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR =
   'ANTHROPIC_CLAUDE_CODE_VERSION'
+export const ANTHROPIC_AUTH_MODEL_PIN_ENV_VAR = 'ANTHROPIC_AUTH_MODEL_PIN'
+export const ANTHROPIC_QUOTA_CACHE_TTL_ENV_VAR = 'ANTHROPIC_QUOTA_CACHE_TTL_MS'
+export const ANTHROPIC_AUTH_PROBE_IDLE_ENV_VAR = 'ANTHROPIC_AUTH_PROBE_IDLE'
+
+export const DEFAULT_QUOTA_CACHE_TTL_MS = 60_000
+
+/**
+ * Quota-cache TTL for sticky strategies. Malformed/negative values fall back
+ * to the default. Never throws.
+ */
+export function resolveQuotaCacheTtlMs(
+  raw: string | undefined = process.env[ANTHROPIC_QUOTA_CACHE_TTL_ENV_VAR],
+): number {
+  if (raw === undefined) return DEFAULT_QUOTA_CACHE_TTL_MS
+  const parsed = Number.parseInt(raw.trim(), 10)
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_QUOTA_CACHE_TTL_MS
+  return parsed
+}
+
+/**
+ * Opt-in idle probe: `1`/`true` fetches quota for tokenless-idle accounts at
+ * session start to discover `resets_at` windows. Off by default so session
+ * start costs no model quota. Never throws.
+ */
+export function shouldProbeIdleAccounts(
+  raw: string | undefined = process.env[ANTHROPIC_AUTH_PROBE_IDLE_ENV_VAR],
+): boolean {
+  const normalized = (raw ?? '').trim().toLowerCase()
+  return normalized === '1' || normalized === 'true'
+}
 
 /** Claude Code releases are `major.minor.patch` with numeric components. */
 const VERSION_PATTERN = /^\d+\.\d+\.\d+$/

@@ -1,10 +1,28 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { AnthropicAuthPlugin } from '../index'
+import { ACCOUNTS_PATH_ENV_VAR, loadAccounts } from '../storage'
 
 const originalFetch = globalThis.fetch
+const originalAccountsPath = process.env[ACCOUNTS_PATH_ENV_VAR]
+let sandboxDir = ''
+
+beforeEach(() => {
+  sandboxDir = mkdtempSync(join(tmpdir(), 'anthropic-methods-test-'))
+  process.env[ACCOUNTS_PATH_ENV_VAR] = join(
+    sandboxDir,
+    'anthropic-accounts.json',
+  )
+})
 
 afterEach(() => {
   globalThis.fetch = originalFetch
+  if (originalAccountsPath === undefined)
+    delete process.env[ACCOUNTS_PATH_ENV_VAR]
+  else process.env[ACCOUNTS_PATH_ENV_VAR] = originalAccountsPath
+  rmSync(sandboxDir, { recursive: true, force: true })
 })
 
 type FetchCall = {
@@ -74,7 +92,12 @@ describe('Claude Pro/Max OAuth method', () => {
   test('callback exchanges the authorization code for OAuth credentials', async () => {
     const method = await getOAuthMethod(0)
     const authorization = await method.authorize()
-    const calls = installFetchStub(() => tokenResponse())
+    const calls = installFetchStub(({ url }) => {
+      if (url.includes('/api/oauth/profile')) {
+        return Response.json({ email: 'new@example.com' })
+      }
+      return tokenResponse()
+    })
 
     const credentials = await authorization.callback(
       callbackCode(authorization.url),
@@ -83,12 +106,21 @@ describe('Claude Pro/Max OAuth method', () => {
     expect(credentials.type).toBe('success')
     expect(credentials.access).toBe('access-token')
     expect(credentials.refresh).toBe('refresh-token')
-    expect(calls).toHaveLength(1)
+    // Token exchange + best-effort profile lookup for email auto-fill.
+    expect(calls).toHaveLength(2)
     expect(calls[0]?.url).toBe('https://platform.claude.com/v1/oauth/token')
 
     const body = JSON.parse(String(calls[0]?.init?.body))
     expect(body.code).toBe('authorization-code')
     expect(body.grant_type).toBe('authorization_code')
+
+    // The new account is persisted to multi-account storage with its email.
+    const stored = loadAccounts(process.env[ACCOUNTS_PATH_ENV_VAR])
+    expect(stored.accounts).toHaveLength(1)
+    expect(stored.accounts[0]).toMatchObject({
+      refresh: 'refresh-token',
+      email: 'new@example.com',
+    })
   })
 
   test('callback reports a failed token exchange', async () => {

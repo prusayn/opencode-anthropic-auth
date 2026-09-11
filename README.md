@@ -118,6 +118,48 @@ The plugin reads the following environment variables:
 
 Anthropic gates model access on the reported Claude Code version server-side, returning a 400 `claude_code_version_too_old` error for models that require a newer client. `ANTHROPIC_CLAUDE_CODE_VERSION` lets you raise the reported version without waiting for a plugin release.
 
+## Multi-Account
+
+Running `/connect` → `Claude Pro/Max` again adds another account instead of replacing the first. Your existing login migrates automatically to account 1 — no setup needed for single-account users.
+
+Accounts live in `~/.config/opencode/anthropic-accounts.json` (`0600`, atomic writes, crash-safe against concurrent OpenCode processes).
+
+### Strategies (`ANTHROPIC_AUTH_STRATEGY`)
+
+| Strategy | Behavior |
+|----------|----------|
+| `smart` (default) | Sticky per session: weekly-utilization-first pick, bonus for accounts whose weekly window resets soon (spend what's about to renew), guardrail preserving 5h headroom unless the 5h window renews imminently, plus a fairness penalty so one account doesn't absorb the whole week. Falls back to rotation when the quota API is unreachable. |
+| `lowest_quota` | Sticky per session on the lowest weekly (else 5-hour) utilization. Falls back to rotation when quota data is unavailable. |
+| `round_robin` | Rotates accounts every request; no quota API calls on the request path. |
+
+On `429` the plugin honors `Retry-After`, marks the account limited, and retries once on the next eligible account (single retry; a clear "all rate-limited, shortest wait Xs" error when exhausted). On `401` it force-refreshes once, then fails over once. Refreshes are deduplicated per account, so concurrent requests share one token call.
+
+### Environment variables
+
+- **`ANTHROPIC_AUTH_STRATEGY`** — `smart` (default) | `lowest_quota` | `round_robin`. Unknown values log a warning and use `smart`.
+- **`ANTHROPIC_ACCOUNTS_PATH`** — Override the accounts file location.
+- **`ANTHROPIC_QUOTA_CACHE_TTL_MS`** — Quota-cache TTL for sticky strategies (default `60000`).
+- **`ANTHROPIC_AUTH_MODEL_PIN`** — §9 per-model routing, e.g. `opus:0,sonnet:1` pins model prefixes to account indexes.
+- **`ANTHROPIC_AUTH_PROBE_IDLE`** — Set to `1`/`true` to refresh expired tokens at session start so quota windows can be discovered up front. Off by default (session start costs no model quota).
+
+### Managing accounts
+
+The plugin host has no stdin, so account admin is a CLI, not an auth-menu prompt:
+
+```bash
+bun scripts/accounts.ts list          # accounts, active marker
+bun scripts/accounts.ts usage         # + per-account quota utilization
+bun scripts/accounts.ts add           # interactive OAuth wizard for one more account
+bun scripts/accounts.ts remove <n>    # drop an account
+bun scripts/accounts.ts enable <n> | disable <n>
+```
+
+Compare strategies on synthetic 5h/7d scenarios:
+
+```bash
+bun scripts/simulate-strategies.ts --trials 200 --seed 42
+```
+
 ## How It Works
 
 For Claude Pro/Max authentication, both release lines:

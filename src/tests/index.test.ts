@@ -1,8 +1,12 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { buildBillingHeaderValue } from '../cch'
 import { ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR } from '../config'
 import { CLAUDE_CODE_VERSION } from '../constants'
 import { AnthropicAuthPlugin } from '../index'
+import { ACCOUNTS_PATH_ENV_VAR } from '../storage'
 
 /** Extract the URL string from a fetch input (string, URL, or Request). */
 function extractUrl(input: string | URL | Request): string {
@@ -72,9 +76,17 @@ async function getPlugin(client?: ReturnType<typeof createMockClient>) {
 // value in the developer's shell would otherwise leak into every test in this
 // file.
 const originalVersionEnv = process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR]
+const originalAccountsPath = process.env[ACCOUNTS_PATH_ENV_VAR]
+let sandboxDir: string | undefined
 
 beforeEach(() => {
   delete process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR]
+  // Sandbox multi-account storage so migration writes never touch the real home dir.
+  sandboxDir = mkdtempSync(join(tmpdir(), 'anthropic-auth-test-'))
+  process.env[ACCOUNTS_PATH_ENV_VAR] = join(
+    sandboxDir,
+    'anthropic-accounts.json',
+  )
 })
 
 afterEach(() => {
@@ -82,6 +94,15 @@ afterEach(() => {
     delete process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR]
   } else {
     process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR] = originalVersionEnv
+  }
+  if (originalAccountsPath === undefined) {
+    delete process.env[ACCOUNTS_PATH_ENV_VAR]
+  } else {
+    process.env[ACCOUNTS_PATH_ENV_VAR] = originalAccountsPath
+  }
+  if (sandboxDir) {
+    rmSync(sandboxDir, { recursive: true, force: true })
+    sandboxDir = undefined
   }
 })
 
