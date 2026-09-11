@@ -74,10 +74,6 @@ export class AccountManager {
     return this.accounts[this.cursor]
   }
 
-  eligible(now = Date.now()): number[] {
-    return eligibleIndexes(this.accounts, now)
-  }
-
   /** Per-request rotation for `round_robin` (synchronous; no I/O). */
   nextRoundRobin(
     now = Date.now(),

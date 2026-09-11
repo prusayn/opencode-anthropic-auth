@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { normalizeUtilization } from './quota.ts'
 
 export type QuotaCache = {
   /** Utilization as 0..1 ratio (normalized on write). Null when unknown. */
@@ -34,11 +35,6 @@ export type AccountStorage = {
 export const DEFAULT_STORAGE_FILENAME = 'anthropic-accounts.json'
 export const ACCOUNTS_PATH_ENV_VAR = 'ANTHROPIC_ACCOUNTS_PATH'
 
-/** Stale lock age before another process may steal it. */
-const LOCK_STALE_MS = 5_000
-const LOCK_WAIT_MS = 50
-const LOCK_ATTEMPTS = 40
-
 function defaultStoragePath(): string {
   return path.join(
     os.homedir(),
@@ -59,16 +55,6 @@ export function resolveStoragePath(
 
 function cloneDefaultStorage(): AccountStorage {
   return { version: 1, accounts: [], cursor: 0 }
-}
-
-/** Clamp any utilization-shaped value to a 0..1 ratio. Accepts 0..1 or 0..100. */
-export function normalizeUtilization(value: unknown): number | null {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
-    return null
-  }
-  if (value <= 1) return value
-  if (value <= 100) return value / 100
-  return 1
 }
 
 function normalizeAccount(entry: unknown, now: number): StoredAccount | null {
@@ -149,52 +135,6 @@ export function normalizeStorage(
   return { version: 1, accounts, cursor }
 }
 
-function lockPathFor(storagePath: string): string {
-  return `${storagePath}.lock`
-}
-
-function tryAcquireLock(lockPath: string, now: number): boolean {
-  try {
-    const fd = fs.openSync(lockPath, 'wx', 0o600)
-    fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: now }))
-    fs.closeSync(fd)
-    return true
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') return false
-    // §9 cross-process lock: steal stale locks so a crashed process can't wedge writers.
-    try {
-      const raw = fs.readFileSync(lockPath, 'utf8')
-      const at = (JSON.parse(raw) as { at?: unknown }).at
-      if (typeof at === 'number' && now - at > LOCK_STALE_MS) {
-        fs.rmSync(lockPath, { force: true })
-        return tryAcquireLock(lockPath, now)
-      }
-    } catch {
-      // Unreadable lock file: fall through to wait/retry.
-    }
-    return false
-  }
-}
-
-function withFileLock<T>(storagePath: string, fn: () => T): T {
-  const lockPath = lockPathFor(storagePath)
-  let acquired = false
-  for (let attempt = 0; attempt < LOCK_ATTEMPTS; attempt++) {
-    if (tryAcquireLock(lockPath, Date.now())) {
-      acquired = true
-      break
-    }
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, LOCK_WAIT_MS)
-  }
-  // Best-effort: if the lock is wedged, proceed with the atomic rename write
-  // rather than failing the request path.
-  try {
-    return fn()
-  } finally {
-    if (acquired) fs.rmSync(lockPath, { force: true })
-  }
-}
-
 export function loadAccounts(storagePath?: string): AccountStorage {
   const finalPath = resolveStoragePath(storagePath)
   if (!fs.existsSync(finalPath)) return cloneDefaultStorage()
@@ -211,12 +151,11 @@ export function saveAccounts(data: AccountStorage, storagePath?: string): void {
   fs.mkdirSync(path.dirname(finalPath), { recursive: true })
   const normalized = normalizeStorage(data)
   const content = `${JSON.stringify(normalized, null, 2)}\n`
-  withFileLock(finalPath, () => {
-    const tempPath = `${finalPath}.${process.pid}.${Date.now()}.tmp`
-    fs.writeFileSync(tempPath, content, { encoding: 'utf8', mode: 0o600 })
-    fs.renameSync(tempPath, finalPath)
-    fs.chmodSync(finalPath, 0o600)
-  })
+  // Crash-safe without a lockfile: tmp-write + atomic rename.
+  const tempPath = `${finalPath}.${process.pid}.${Date.now()}.tmp`
+  fs.writeFileSync(tempPath, content, { encoding: 'utf8', mode: 0o600 })
+  fs.renameSync(tempPath, finalPath)
+  fs.chmodSync(finalPath, 0o600)
 }
 
 export function addAccount(

@@ -12,7 +12,7 @@
  */
 import readline from 'node:readline'
 import { authorize, exchange } from '../src/auth.ts'
-import { fetchAccountEmail, fetchQuota } from '../src/quota.ts'
+import { fetchAccountEmail, fetchQuota, getUtilization } from '../src/quota.ts'
 import {
   loadAccounts,
   removeAccount,
@@ -54,7 +54,7 @@ async function listCommand(showUsage: boolean): Promise<void> {
         usage = ' (token expired — open OpenCode once to refresh)'
       } else {
         const quota = await fetchQuota(access).catch(() => null)
-        const utilization = quota?.sevenDay ?? quota?.fiveHour
+        const utilization = quota ? getUtilization(quota) : null
         usage =
           utilization === null || utilization === undefined
             ? ' — usage unavailable'

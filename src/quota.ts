@@ -15,7 +15,8 @@ export type QuotaSnapshot = {
   fetchedAt: number
 }
 
-function toRatio(value: unknown): number | null {
+/** Clamp any utilization-shaped value to a 0..1 ratio. Accepts 0..1 or 0..100. */
+export function normalizeUtilization(value: unknown): number | null {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
     return null
   }
@@ -43,8 +44,8 @@ export function snapshotFromResponse(
   now = Date.now(),
 ): QuotaSnapshot {
   return {
-    fiveHour: toRatio(quota.five_hour?.utilization),
-    sevenDay: toRatio(quota.seven_day?.utilization),
+    fiveHour: normalizeUtilization(quota.five_hour?.utilization),
+    sevenDay: normalizeUtilization(quota.seven_day?.utilization),
     ...(toDateString(quota.five_hour?.resets_at)
       ? { fiveHourResetsAt: toDateString(quota.five_hour?.resets_at) }
       : {}),

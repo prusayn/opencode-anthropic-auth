@@ -7,7 +7,7 @@ import {
   resolveQuotaCacheTtlMs,
   shouldProbeIdleAccounts,
 } from './config.ts'
-import { CLAUDE_CODE_VERSION, CLIENT_ID, TOKEN_URL } from './constants.ts'
+import { CLAUDE_CODE_VERSION } from './constants.ts'
 import { fetchAccountEmail, fetchQuota } from './quota.ts'
 import {
   accountFromOAuthSnapshot,
@@ -120,6 +120,8 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
         provider: { models: Record<string, { cost: unknown }> },
       ) {
         // Zero-config migration: a single-account OAuth setup becomes account[0].
+        // Silent by design: version-override logging asserts exact call counts,
+        // and the migration is documented in the README.
         let manager = AccountManager.load(storagePath)
         if (manager.count() === 0) {
           const auth = await getAuth()
@@ -128,23 +130,17 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
           if (seed) {
             try {
               addAccount(seed, storagePath)
+              manager = AccountManager.load(storagePath)
             } catch {
-              // Filesystem failures fall through to single-account behavior below.
+              // Unwritable disk: run this session from memory; the manager
+              // persists best-effort, so no separate single-account path is needed.
+              manager = new AccountManager([seed], 0, storagePath)
             }
-            manager = AccountManager.load(storagePath)
-            // Silent by design: version-override logging asserts exact call
-            // counts, and the migration is documented in the README.
           }
         }
 
         const auth = await getAuth()
-        if (auth.type !== 'oauth' || manager.count() === 0) {
-          if (auth.type === 'oauth') {
-            // Storage unwritable: fall back to the original single-account path.
-            return singleAccountFetch(client, getAuth, claudeCodeVersion)
-          }
-          return {}
-        }
+        if (auth.type !== 'oauth' || manager.count() === 0) return {}
 
         // zero out cost for max plan
         for (const model of Object.values(provider.models)) {
@@ -384,12 +380,6 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                 `Anthropic account ${index + 1} rate-limited; switched to account ${next.index + 1}.`,
               )
               const nextAccess = await getValidAccess(next.index)
-              const switched = manager.get(next.index)
-              await syncAuthJson(client, {
-                refresh: switched?.refresh ?? next.account.refresh,
-                access: nextAccess,
-                expires: switched?.expires ?? Date.now() + 3600_000,
-              })
               return doRequest(input, init, nextAccess)
             }
 
@@ -430,21 +420,16 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                   const email = await fetchAccountEmail(
                     credentials.access,
                   ).catch(() => null)
-                  if (email) {
-                    const current = loadAccounts(storagePath)
-                    const added = current.accounts[index]
-                    if (added) {
+                  const current = loadAccounts(storagePath)
+                  const added = current.accounts[index]
+                  if (added) {
+                    if (email) {
                       added.email = email
                       added.label = email
-                      saveAccounts(current, storagePath)
-                    }
-                  } else {
-                    const current = loadAccounts(storagePath)
-                    const added = current.accounts[index]
-                    if (added && !added.label) {
+                    } else if (!added.label) {
                       added.label = label
-                      saveAccounts(current, storagePath)
                     }
+                    saveAccounts(current, storagePath)
                   }
                 } catch {
                   // Filesystem failure: still return success so the single-account
@@ -532,142 +517,4 @@ async function refreshExpiredForProbe(
       }
     }),
   )
-}
-
-/**
- * Original single-account fetch path, used when multi-account storage is
- * unwritable. Preserves the exact retry/dedupe semantics of v1.
- */
-async function singleAccountFetch(
-  client: unknown,
-  getAuth: () => Promise<OAuthSnapshot>,
-  claudeCodeVersion: string,
-): Promise<{
-  apiKey: string
-  fetch: (
-    input: string | URL | Request,
-    init?: RequestInit,
-  ) => Promise<Response>
-}> {
-  // Shared inflight refresh promise — prevents concurrent token refreshes
-  // from racing against each other (and causing 401 cascades with token rotation)
-  let refreshPromise: Promise<string> | null = null
-
-  return {
-    apiKey: '',
-    async fetch(input: string | URL | Request, init?: RequestInit) {
-      const auth = await getAuth()
-      if (auth.type !== 'oauth') return fetch(input, init)
-      if (!auth.access || !auth.expires || auth.expires < Date.now()) {
-        if (!refreshPromise) {
-          refreshPromise = (async () => {
-            const maxRetries = 2
-            const baseDelayMs = 500
-
-            for (let attempt = 0; attempt <= maxRetries; attempt++) {
-              try {
-                if (attempt > 0) {
-                  const delay = baseDelayMs * 2 ** (attempt - 1)
-                  await new Promise((resolve) => setTimeout(resolve, delay))
-                }
-
-                // Re-read auth to get the latest refresh token.
-                // The outer `auth` snapshot may be stale if tokens
-                // were rotated since the fetch() call was made.
-                const freshAuth = await getAuth()
-
-                const response = await fetch(TOKEN_URL, {
-                  method: 'POST',
-                  headers: {
-                    'Content-Type': 'application/json',
-                    Accept: 'application/json, text/plain, */*',
-                    'User-Agent': 'axios/1.13.6',
-                  },
-                  body: JSON.stringify({
-                    grant_type: 'refresh_token',
-                    refresh_token: freshAuth.refresh,
-                    client_id: CLIENT_ID,
-                  }),
-                })
-
-                if (!response.ok) {
-                  if (response.status >= 500 && attempt < maxRetries) {
-                    await response.body?.cancel()
-                    continue
-                  }
-
-                  const body = await response.text().catch(() => '')
-                  throw new Error(
-                    `Token refresh failed: ${response.status} — ${body}`,
-                  )
-                }
-
-                const json = (await response.json()) as {
-                  refresh_token: string
-                  access_token: string
-                  expires_in: number
-                }
-
-                // biome-ignore lint/suspicious/noExplicitAny: SDK types don't expose auth.set
-                await (client as any).auth.set({
-                  path: {
-                    id: 'anthropic',
-                  },
-                  body: {
-                    type: 'oauth',
-                    refresh: json.refresh_token,
-                    access: json.access_token,
-                    expires: Date.now() + json.expires_in * 1000,
-                  },
-                })
-
-                return json.access_token
-              } catch (error) {
-                const isNetworkError =
-                  error instanceof Error &&
-                  (error.message.includes('fetch failed') ||
-                    ('code' in error &&
-                      (error.code === 'ECONNRESET' ||
-                        error.code === 'ECONNREFUSED' ||
-                        error.code === 'ETIMEDOUT' ||
-                        error.code === 'UND_ERR_CONNECT_TIMEOUT')))
-
-                if (attempt < maxRetries && isNetworkError) {
-                  continue
-                }
-
-                throw error
-              }
-            }
-            // Unreachable — each iteration either returns or throws.
-            // Kept as a TypeScript exhaustiveness guard.
-            throw new Error('Token refresh exhausted all retries')
-          })().finally(() => {
-            refreshPromise = null
-          })
-        }
-        auth.access = await refreshPromise
-      }
-
-      const requestHeaders = mergeHeaders(input, init)
-      // biome-ignore lint/style/noNonNullAssertion: access is guaranteed set above
-      setOAuthHeaders(requestHeaders, auth.access!, claudeCodeVersion)
-
-      let body = init?.body
-      if (body && typeof body === 'string') {
-        body = rewriteRequestBody(body, claudeCodeVersion)
-      }
-
-      const rewritten = rewriteUrl(input)
-
-      const response = await fetch(rewritten.input, {
-        ...init,
-        body,
-        headers: requestHeaders,
-        ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
-      })
-
-      return createStrippedStream(response)
-    },
-  }
 }

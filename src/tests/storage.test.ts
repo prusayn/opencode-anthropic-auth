@@ -2,12 +2,12 @@ import { describe, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { normalizeUtilization } from '../quota'
 import {
   accountFromOAuthSnapshot,
   addAccount,
   loadAccounts,
   normalizeStorage,
-  normalizeUtilization,
   removeAccount,
   resolveStoragePath,
   type StoredAccount,

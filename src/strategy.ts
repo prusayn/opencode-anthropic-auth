@@ -16,7 +16,7 @@ export function parseStrategy(raw: string | undefined): StrategyName {
     return 'round_robin'
   if (normalized === 'lowest_quota' || normalized === 'lowest-quota')
     return 'lowest_quota'
-  return 'smart'
+  return DEFAULT_STRATEGY
 }
 
 export function isStrategyOverridden(raw: string | undefined): boolean {
