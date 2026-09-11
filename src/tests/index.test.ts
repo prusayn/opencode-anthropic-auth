@@ -117,9 +117,9 @@ describe('AnthropicAuthPlugin', () => {
 })
 
 describe('auth.methods', () => {
-  test('has three auth methods', async () => {
+  test('has five auth methods', async () => {
     const plugin = await getPlugin()
-    expect(plugin.auth.methods).toHaveLength(3)
+    expect(plugin.auth.methods).toHaveLength(5)
   })
 
   test('first method is Claude Pro/Max OAuth with code flow', async () => {
@@ -144,6 +144,14 @@ describe('auth.methods', () => {
     expect(method.label).toBe('Manually enter API Key')
     expect(method.type).toBe('api')
     expect(method.provider).toBe('anthropic')
+  })
+
+  test('fourth and fifth methods manage accounts in-menu', async () => {
+    const plugin = await getPlugin()
+    expect(plugin.auth.methods[3].label).toBe('View Account Usage')
+    expect(plugin.auth.methods[3].type).toBe('oauth')
+    expect(plugin.auth.methods[4].label).toBe('Manage Accounts')
+    expect(plugin.auth.methods[4].type).toBe('oauth')
   })
 })
 

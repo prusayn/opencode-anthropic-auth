@@ -8,14 +8,16 @@ import {
   shouldProbeIdleAccounts,
 } from './config.ts'
 import { CLAUDE_CODE_VERSION } from './constants.ts'
-import { fetchAccountEmail, fetchQuota } from './quota.ts'
+import { fetchAccountEmail, fetchQuota, getUtilization } from './quota.ts'
 import {
   accountFromOAuthSnapshot,
   addAccount,
   loadAccounts,
+  removeAccount,
   resolveStoragePath,
   type StoredAccount,
   saveAccounts,
+  setAccountEnabled,
 } from './storage.ts'
 import {
   isStrategyOverridden,
@@ -83,6 +85,17 @@ async function syncAuthJson(
   }
 }
 
+/** Compact duration for usage lines, e.g. `45s`, `3h 12m`, `2d 4h`. */
+function formatWait(ms: number): string {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000))
+  if (totalSeconds < 60) return `${totalSeconds}s`
+  const totalMinutes = Math.floor(totalSeconds / 60)
+  if (totalMinutes < 60) return `${totalMinutes}m`
+  const hours = Math.floor(totalMinutes / 60)
+  if (hours < 48) return `${hours}h ${totalMinutes % 60}m`
+  return `${Math.floor(hours / 24)}d ${hours % 24}h`
+}
+
 export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
   // Resolved once per plugin instance so every request reports the same
   // version in both the user-agent and the billing header.
@@ -111,6 +124,93 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
     process.env[ANTHROPIC_AUTH_MODEL_PIN_ENV_VAR],
   )
   const storagePath = resolveStoragePath()
+
+  /**
+   * Finish an account-menu flow without changing credentials: return the
+   * active account's (refreshed) tokens so `/connect` completes. Never throws.
+   */
+  const getExistingOAuthResult = async (): Promise<
+    | { type: 'success'; refresh: string; access: string; expires: number }
+    | { type: 'failed' }
+  > => {
+    const data = loadAccounts(storagePath)
+    const active = data.accounts[data.cursor] ?? data.accounts[0]
+    if (!active) return { type: 'failed' }
+    const { refresh, access, expires } = active
+    if (access && expires && expires > Date.now() + 30_000) {
+      return { type: 'success', refresh, access, expires }
+    }
+    try {
+      const tokens = await refreshAccessToken(refresh)
+      active.refresh = tokens.refresh
+      active.access = tokens.access
+      active.expires = tokens.expires
+      try {
+        saveAccounts(data, storagePath)
+      } catch {
+        // Persistence is best-effort here; the returned tokens still apply.
+      }
+      await syncAuthJson(client, tokens)
+      return { type: 'success', ...tokens }
+    } catch {
+      return { type: 'failed' }
+    }
+  }
+
+  /**
+   * One numbered line per account for the auth-menu methods. Refreshes expired
+   * tokens and reads quota best-effort; anything failing degrades to
+   * `unavailable` rather than failing the menu. Never throws.
+   */
+  const describeAccounts = async (): Promise<string> => {
+    const data = loadAccounts(storagePath)
+    if (data.accounts.length === 0) {
+      return 'No accounts configured. Use Claude Pro/Max first.'
+    }
+    const lines = await Promise.all(
+      data.accounts.map(async (account, i) => {
+        const n = i + 1
+        const label = account.label || account.email || `Account ${n}`
+        const status = account.enabled ? 'enabled' : 'disabled'
+        const active = i === data.cursor ? ' (active)' : ''
+        if (
+          typeof account.rateLimitedUntil === 'number' &&
+          account.rateLimitedUntil > Date.now()
+        ) {
+          return `  ${n}. ${label} [${status}]${active} — rate-limited, retry in ${formatWait(account.rateLimitedUntil - Date.now())}`
+        }
+        let access = account.access
+        if (!access || (account.expires ?? 0) < Date.now() + 30_000) {
+          try {
+            const tokens = await refreshAccessToken(account.refresh)
+            account.refresh = tokens.refresh
+            account.access = tokens.access
+            account.expires = tokens.expires
+            access = tokens.access
+          } catch {
+            return `  ${n}. ${label} [${status}]${active} — token refresh failed, re-authenticate`
+          }
+        }
+        const quota = access ? await fetchQuota(access).catch(() => null) : null
+        const utilization = quota ? getUtilization(quota) : null
+        if (utilization === null || utilization === undefined) {
+          return `  ${n}. ${label} [${status}]${active} — usage unavailable`
+        }
+        const resetsAt = quota?.sevenDayResetsAt ?? quota?.fiveHourResetsAt
+        const resets =
+          resetsAt && !Number.isNaN(Date.parse(resetsAt))
+            ? ` (resets in ${formatWait(Date.parse(resetsAt) - Date.now())})`
+            : ''
+        return `  ${n}. ${label} [${status}]${active} — ${(utilization * 100).toFixed(1)}% used${resets}`
+      }),
+    )
+    try {
+      saveAccounts(data, storagePath)
+    } catch {
+      // Best-effort: refreshed tokens are still returned by the menu flow.
+    }
+    return `Anthropic accounts:\n${lines.join('\n')}`
+  }
 
   return {
     auth: {
@@ -486,6 +586,58 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
           provider: 'anthropic',
           label: 'Manually enter API Key',
           type: 'api',
+        },
+        {
+          label: 'View Account Usage',
+          type: 'oauth',
+          authorize: async () => {
+            // Shown in the host UI and echoed to the log for hosts that
+            // auto-complete code-less methods without displaying instructions.
+            const table = await describeAccounts()
+            console.log(table)
+            return {
+              url: '',
+              instructions: `${table}\n\nType anything to finish.`,
+              method: 'code',
+              callback: async () => getExistingOAuthResult(),
+            }
+          },
+        },
+        {
+          label: 'Manage Accounts',
+          type: 'oauth',
+          authorize: async () => {
+            const table = await describeAccounts()
+            const instructions =
+              `${table}\n\n` +
+              'Reply with <number> to remove it, e<number> to enable, ' +
+              'd<number> to disable, or anything else to cancel.'
+            console.log(instructions)
+            return {
+              url: '',
+              instructions,
+              method: 'code',
+              callback: async (input: string) => {
+                const text = (input ?? '').trim().toLowerCase()
+                const remove = text.match(/^(\d+)$/)
+                const toggle = text.match(/^([ed])\s*(\d+)$/)
+                const data = loadAccounts(storagePath)
+                const valid = (n: number) =>
+                  Number.isInteger(n) && n >= 1 && n <= data.accounts.length
+                // Anything unrecognized (or out of range) cancels: storage untouched.
+                if (remove) {
+                  const n = Number.parseInt(remove[1] ?? '', 10)
+                  if (valid(n)) removeAccount(n - 1, storagePath)
+                } else if (toggle) {
+                  const n = Number.parseInt(toggle[2] ?? '', 10)
+                  if (valid(n)) {
+                    setAccountEnabled(n - 1, toggle[1] === 'e', storagePath)
+                  }
+                }
+                return getExistingOAuthResult()
+              },
+            }
+          },
         },
       ],
     },

@@ -88,12 +88,15 @@ Substitute the command output for `<version>`:
 
 ### OpenCode v1
 
-OpenCode v1 provides three authentication options:
+OpenCode v1 provides five authentication options:
 
 - **Claude Pro/Max** — OAuth flow via `claude.ai` for Pro/Max subscribers. Uses your existing subscription at no additional API cost.
     - Run `/connect`, select `Anthropic (API key)` -> `Claude Pro/Max`, and complete OAuth.
+    - Running it again adds another account instead of replacing the first.
 - **Create an API Key** — OAuth flow via `console.anthropic.com` that creates an API key on your behalf.
 - **Manually enter API Key** — Standard API-key entry for users who already have one.
+- **View Account Usage** — Shows every account with quota utilization and reset countdowns, right in the `/connect` menu.
+- **Manage Accounts** — Remove (`<number>`), enable (`e<number>`), or disable (`d<number>`) accounts by replying in the `/connect` prompt. Anything else cancels without changing anything.
 
 ### OpenCode v2
 
@@ -144,15 +147,11 @@ On `429` the plugin honors `Retry-After`, marks the account limited, and retries
 
 ### Managing accounts
 
-The plugin host has no stdin, so account admin is a CLI, not an auth-menu prompt:
+Everything lives in the `/connect` menu — no separate tooling:
 
-```bash
-bun scripts/accounts.ts list          # accounts, active marker
-bun scripts/accounts.ts usage         # + per-account quota utilization
-bun scripts/accounts.ts add           # interactive OAuth wizard for one more account
-bun scripts/accounts.ts remove <n>    # drop an account
-bun scripts/accounts.ts enable <n> | disable <n>
-```
+- Run `/connect` → `Claude Pro/Max` again to add another account.
+- Run `/connect` → `View Account Usage` to see per-account utilization and reset countdowns.
+- Run `/connect` → `Manage Accounts`, then reply with `<number>` to remove it, `e<number>` to enable, `d<number>` to disable, or anything else to cancel.
 
 Compare strategies on synthetic 5h/7d scenarios:
 

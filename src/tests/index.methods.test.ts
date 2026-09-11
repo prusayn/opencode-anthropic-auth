@@ -3,7 +3,12 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AnthropicAuthPlugin } from '../index'
-import { ACCOUNTS_PATH_ENV_VAR, loadAccounts } from '../storage'
+import {
+  ACCOUNTS_PATH_ENV_VAR,
+  loadAccounts,
+  type StoredAccount,
+  saveAccounts,
+} from '../storage'
 
 const originalFetch = globalThis.fetch
 const originalAccountsPath = process.env[ACCOUNTS_PATH_ENV_VAR]
@@ -189,5 +194,153 @@ describe('Create an API Key OAuth method', () => {
 
     expect(credentials).toEqual({ type: 'failed' })
     expect(calls).toHaveLength(1)
+  })
+})
+
+const MENU_FUTURE = Date.now() + 3600_000
+
+function seedMenuAccounts(partials: Partial<StoredAccount>[]): void {
+  saveAccounts(
+    {
+      version: 1,
+      cursor: 0,
+      accounts: partials.map((partial, i) => ({
+        refresh: `refresh-${i}`,
+        access: `access-${i}`,
+        expires: MENU_FUTURE,
+        addedAt: Date.now() - 1000,
+        enabled: true,
+        ...partial,
+      })),
+    },
+    process.env[ACCOUNTS_PATH_ENV_VAR],
+  )
+}
+
+function storedRefreshes(): (string | undefined)[] {
+  return loadAccounts(process.env[ACCOUNTS_PATH_ENV_VAR]).accounts.map(
+    (account) => account.refresh,
+  )
+}
+
+describe('View Account Usage method', () => {
+  test('authorize lists accounts with utilization in instructions', async () => {
+    seedMenuAccounts([
+      { label: 'alice@example.com' },
+      { label: 'bob@example.com' },
+    ])
+    installFetchStub(({ url }) => {
+      if (url.includes('/api/oauth/usage')) {
+        return Response.json({
+          five_hour: { utilization: 0.5 },
+          seven_day: {
+            utilization: 0.25,
+            resets_at: new Date(Date.now() + 3600_000).toISOString(),
+          },
+        })
+      }
+      return tokenResponse()
+    })
+
+    const method = await getOAuthMethod(3)
+    const authorization = await method.authorize()
+
+    expect(authorization.instructions).toContain('alice@example.com')
+    expect(authorization.instructions).toContain('bob@example.com')
+    expect(authorization.instructions).toContain('25.0%')
+  })
+
+  test('callback finishes without changing credentials', async () => {
+    seedMenuAccounts([{}, {}])
+    installFetchStub(({ url }) => {
+      if (url.includes('/api/oauth/usage')) {
+        return Response.json({ five_hour: { utilization: 0.1 } })
+      }
+      return tokenResponse()
+    })
+
+    const method = await getOAuthMethod(3)
+    const authorization = await method.authorize()
+    const credentials = await authorization.callback('anything')
+
+    expect(credentials).toEqual({
+      type: 'success',
+      refresh: 'refresh-0',
+      access: 'access-0',
+      expires: MENU_FUTURE,
+    })
+    expect(storedRefreshes()).toEqual(['refresh-0', 'refresh-1'])
+  })
+
+  test('callback fails gracefully with no accounts configured', async () => {
+    const method = await getOAuthMethod(3)
+    const authorization = await method.authorize()
+
+    expect(authorization.instructions).toContain('No accounts configured')
+    await expect(authorization.callback('anything')).resolves.toEqual({
+      type: 'failed',
+    })
+  })
+})
+
+describe('Manage Accounts method', () => {
+  test('authorize shows the numbered account list and reply legend', async () => {
+    seedMenuAccounts([{ label: 'alice@example.com' }])
+    installFetchStub(() => tokenResponse())
+
+    const method = await getOAuthMethod(4)
+    const authorization = await method.authorize()
+
+    expect(authorization.instructions).toContain('1. alice@example.com')
+    expect(authorization.instructions).toContain('e<number>')
+  })
+
+  test('callback removes the numbered account', async () => {
+    seedMenuAccounts([{}, {}])
+    installFetchStub(() => tokenResponse())
+
+    const method = await getOAuthMethod(4)
+    const authorization = await method.authorize()
+    const credentials = await authorization.callback('2')
+
+    expect(storedRefreshes()).toEqual(['refresh-0'])
+    expect(credentials).toEqual({
+      type: 'success',
+      refresh: 'refresh-0',
+      access: 'access-0',
+      expires: MENU_FUTURE,
+    })
+  })
+
+  test('callback disables and enables with d/e prefix', async () => {
+    seedMenuAccounts([{}, {}])
+    installFetchStub(() => tokenResponse())
+
+    const method = await getOAuthMethod(4)
+    const authorization = await method.authorize()
+
+    await authorization.callback('d1')
+    expect(
+      loadAccounts(process.env[ACCOUNTS_PATH_ENV_VAR]).accounts[0]?.enabled,
+    ).toBe(false)
+
+    await authorization.callback('e1')
+    expect(
+      loadAccounts(process.env[ACCOUNTS_PATH_ENV_VAR]).accounts[0]?.enabled,
+    ).toBe(true)
+  })
+
+  test('callback cancels on anything else, leaving storage untouched', async () => {
+    seedMenuAccounts([{}, {}])
+    installFetchStub(() => tokenResponse())
+
+    const method = await getOAuthMethod(4)
+    const authorization = await method.authorize()
+
+    for (const input of ['cancel', '9', '']) {
+      const credentials = await authorization.callback(input)
+      expect(storedRefreshes()).toEqual(['refresh-0', 'refresh-1'])
+      expect(credentials.type).toBe('success')
+    }
   })
 })
